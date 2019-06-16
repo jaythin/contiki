@@ -39,10 +39,10 @@
 #include "sys/energest.h"
 #include "sys/process.h"
 #include "dev/sys-ctrl.h"
-#include "dev/scb.h"
 #include "dev/rfcore-xreg.h"
 #include "rtimer-arch.h"
 #include "lpm.h"
+#include "cc2538_cm3.h"
 #include "reg.h"
 
 #include <stdbool.h>
@@ -78,8 +78,8 @@ static unsigned long irq_energest = 0;
 #if LPM_CONF_STATS
 rtimer_clock_t lpm_stats[3];
 
-#define LPM_STATS_INIT()         do { memset(lpm_stats, 0, sizeof(lpm_stats)); \
-  } while(0)
+#define LPM_STATS_INIT() \
+  do { memset(lpm_stats, 0, sizeof(lpm_stats)); } while(0)
 #define LPM_STATS_ADD(pm, val)   do { lpm_stats[pm] += val; } while(0)
 #else
 #define LPM_STATS_INIT()
@@ -88,14 +88,11 @@ rtimer_clock_t lpm_stats[3];
 /*---------------------------------------------------------------------------*/
 /*
  * Remembers what time it was when went to deep sleep
- * This is used when coming out of PM1/2 to adjust the system clock, which
- * stops ticking while in those PMs
+ * This is used when coming out of PM0/1/2 to keep stats
  */
 static rtimer_clock_t sleep_enter_time;
 
-#define RTIMER_CLOCK_TICK_RATIO (RTIMER_SECOND / CLOCK_SECOND)
-
-void clock_adjust(clock_time_t ticks);
+void clock_adjust(void);
 /*---------------------------------------------------------------------------*/
 /* Stores the currently specified MAX allowed PM */
 static uint8_t max_pm;
@@ -104,7 +101,7 @@ static uint8_t max_pm;
 #ifdef LPM_CONF_PERIPH_PERMIT_PM1_FUNCS_MAX
 #define LPM_PERIPH_PERMIT_PM1_FUNCS_MAX LPM_CONF_PERIPH_PERMIT_PM1_FUNCS_MAX
 #else
-#define LPM_PERIPH_PERMIT_PM1_FUNCS_MAX 2
+#define LPM_PERIPH_PERMIT_PM1_FUNCS_MAX 5
 #endif
 
 static lpm_periph_permit_pm1_func_t
@@ -131,16 +128,12 @@ periph_permit_pm1(void)
 static void
 enter_pm0(void)
 {
-  ENERGEST_OFF(ENERGEST_TYPE_CPU);
-  ENERGEST_ON(ENERGEST_TYPE_LPM);
+  ENERGEST_SWITCH(ENERGEST_TYPE_CPU, ENERGEST_TYPE_LPM);
 
   /* We are only interested in IRQ energest while idle or in LPM */
   ENERGEST_IRQ_RESTORE(irq_energest);
 
-  /*
-   * After PM0 we don't need to adjust the system clock. Thus, saving the time
-   * we enter Deep Sleep is only required if we are keeping stats.
-   */
+  /* Remember the current time so we can keep stats when we wake up */
   if(LPM_CONF_STATS) {
     sleep_enter_time = RTIMER_NOW();
   }
@@ -153,14 +146,13 @@ enter_pm0(void)
   /* Remember IRQ energest for next pass */
   ENERGEST_IRQ_SAVE(irq_energest);
 
-  ENERGEST_ON(ENERGEST_TYPE_CPU);
-  ENERGEST_OFF(ENERGEST_TYPE_LPM);
+  ENERGEST_SWITCH(ENERGEST_TYPE_LPM, ENERGEST_TYPE_CPU);
 }
 /*---------------------------------------------------------------------------*/
 static void
 select_32_mhz_xosc(void)
 {
-  /*First, make sure there is no ongoing clock source change */
+  /* First, make sure there is no ongoing clock source change */
   while((REG(SYS_CTRL_CLOCK_STA) & SYS_CTRL_CLOCK_STA_SOURCE_CHANGE) != 0);
 
   /* Turn on the 32 MHz XOSC and source the system clock on it. */
@@ -169,8 +161,15 @@ select_32_mhz_xosc(void)
   /* Wait for the switch to take place */
   while((REG(SYS_CTRL_CLOCK_STA) & SYS_CTRL_CLOCK_STA_OSC) != 0);
 
-  /* Power down the unused oscillator. */
-  REG(SYS_CTRL_CLOCK_CTRL) |= SYS_CTRL_CLOCK_CTRL_OSC_PD;
+  /* Power down the unused oscillator and restore divisors (silicon errata) */
+  REG(SYS_CTRL_CLOCK_CTRL) = (REG(SYS_CTRL_CLOCK_CTRL)
+#if SYS_CTRL_SYS_DIV == SYS_CTRL_CLOCK_CTRL_SYS_DIV_32MHZ
+    & ~SYS_CTRL_CLOCK_CTRL_SYS_DIV
+#endif
+#if SYS_CTRL_IO_DIV == SYS_CTRL_CLOCK_CTRL_IO_DIV_32MHZ
+    & ~SYS_CTRL_CLOCK_CTRL_IO_DIV
+#endif
+    ) | SYS_CTRL_CLOCK_CTRL_OSC_PD;
 }
 /*---------------------------------------------------------------------------*/
 static void
@@ -178,9 +177,19 @@ select_16_mhz_rcosc(void)
 {
   /*
    * Power up both oscillators in order to speed up the transition to the 32-MHz
-   * XOSC after wake up.
+   * XOSC after wake up. In addition, consider CC2538 silicon errata:
+   * "Possible Incorrect Value of Clock Dividers after PM2 and PM3" and
+   * set system clock divisor / I/O clock divisor to 16 MHz in case they run
+   * at full speed (=32 MHz)
    */
-  REG(SYS_CTRL_CLOCK_CTRL) &= ~SYS_CTRL_CLOCK_CTRL_OSC_PD;
+  REG(SYS_CTRL_CLOCK_CTRL) = (REG(SYS_CTRL_CLOCK_CTRL)
+#if SYS_CTRL_SYS_DIV == SYS_CTRL_CLOCK_CTRL_SYS_DIV_32MHZ
+    | SYS_CTRL_CLOCK_CTRL_SYS_DIV_16MHZ
+#endif
+#if SYS_CTRL_IO_DIV == SYS_CTRL_CLOCK_CTRL_IO_DIV_32MHZ
+    | SYS_CTRL_CLOCK_CTRL_IO_DIV_16MHZ
+#endif
+    ) & ~SYS_CTRL_CLOCK_CTRL_OSC_PD;
 
   /*First, make sure there is no ongoing clock source change */
   while((REG(SYS_CTRL_CLOCK_STA) & SYS_CTRL_CLOCK_STA_SOURCE_CHANGE) != 0);
@@ -215,10 +224,8 @@ lpm_exit()
                 RTIMER_NOW() - sleep_enter_time);
 
   /* Adjust the system clock, since it was not counting while we were sleeping
-   * We need to convert sleep duration from rtimer ticks to clock ticks and
-   * this will cost us some accuracy */
-  clock_adjust((clock_time_t)
-               ((RTIMER_NOW() - sleep_enter_time) / RTIMER_CLOCK_TICK_RATIO));
+   * We need to convert sleep duration from rtimer ticks to clock ticks */
+  clock_adjust();
 
   /* Restore system clock to the 32 MHz XOSC */
   select_32_mhz_xosc();
@@ -229,8 +236,7 @@ lpm_exit()
   /* Remember IRQ energest for next pass */
   ENERGEST_IRQ_SAVE(irq_energest);
 
-  ENERGEST_ON(ENERGEST_TYPE_CPU);
-  ENERGEST_OFF(ENERGEST_TYPE_LPM);
+  ENERGEST_SWITCH(ENERGEST_TYPE_LPM, ENERGEST_TYPE_CPU);
 }
 /*---------------------------------------------------------------------------*/
 void
@@ -303,11 +309,12 @@ lpm_enter()
 
   /* We are only interested in IRQ energest while idle or in LPM */
   ENERGEST_IRQ_RESTORE(irq_energest);
-  ENERGEST_OFF(ENERGEST_TYPE_CPU);
-  ENERGEST_ON(ENERGEST_TYPE_LPM);
+  ENERGEST_SWITCH(ENERGEST_TYPE_CPU, ENERGEST_TYPE_LPM);
 
-  /* Remember the current time so we can adjust the clock when we wake up */
-  sleep_enter_time = RTIMER_NOW();
+  /* Remember the current time so we can keep stats when we wake up */
+  if(LPM_CONF_STATS) {
+    sleep_enter_time = RTIMER_NOW();
+  }
 
   /*
    * Last chance to abort entering Deep Sleep.
@@ -328,8 +335,7 @@ lpm_enter()
 
     /* Remember IRQ energest for next pass */
     ENERGEST_IRQ_SAVE(irq_energest);
-    ENERGEST_ON(ENERGEST_TYPE_CPU);
-    ENERGEST_OFF(ENERGEST_TYPE_LPM);
+    ENERGEST_SWITCH(ENERGEST_TYPE_LPM, ENERGEST_TYPE_CPU);
   } else {
     /* All clear. Assert WFI and drop to PM1/2. This is now un-interruptible */
     assert_wfi();
@@ -373,7 +379,7 @@ lpm_init()
    * By default, we will enter PM0 unless lpm_enter() decides otherwise
    */
   REG(SYS_CTRL_PMCTL) = SYS_CTRL_PMCTL_PM0;
-  REG(SCB_SYSCTRL) |= SCB_SYSCTRL_SLEEPDEEP;
+  SCB->SCR |= SCB_SCR_SLEEPDEEP_Msk;
 
   max_pm = LPM_CONF_MAX_PM;
 

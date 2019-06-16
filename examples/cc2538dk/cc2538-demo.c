@@ -29,10 +29,10 @@
  * OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 /**
- * \addtogroup cc2538
+ * \addtogroup cc2538-platforms
  * @{
  *
- * \defgroup cc2538-examples cc2538dk Example Projects
+ * \defgroup cc2538-examples cc2538 Example Projects
  * @{
  *
  * \defgroup cc2538-demo cc2538dk Demo Project
@@ -50,6 +50,8 @@
  *                - BTN_DOWN turns on LEDS_REBOOT and causes a watchdog reboot
  *                - BTN_UP to soft reset (SYS_CTRL_PWRDBG::FORCE_WARM_RESET)
  *                - BTN_LEFT and BTN_RIGHT flash the LED defined as LEDS_BUTTON
+ * - ADC sensors  : On-chip VDD / 3 and temperature, and ambient light sensor
+ *                  values are printed over UART periodically.
  * - UART         : Every LOOP_INTERVAL the EM will print something over the
  *                  UART. Receiving an entire line of text over UART (ending
  *                  in \\r) will cause LEDS_SERIAL_IN to toggle
@@ -67,7 +69,9 @@
 #include "sys/rtimer.h"
 #include "dev/leds.h"
 #include "dev/uart.h"
+#include "dev/cc2538-sensors.h"
 #include "dev/button-sensor.h"
+#include "dev/als-sensor.h"
 #include "dev/watchdog.h"
 #include "dev/serial-line.h"
 #include "dev/sys-ctrl.h"
@@ -111,7 +115,6 @@ rt_callback(struct rtimer *t, void *ptr)
 /*---------------------------------------------------------------------------*/
 PROCESS_THREAD(cc2538_demo_process, ev, data)
 {
-
   PROCESS_EXITHANDLER(broadcast_close(&bc))
 
   PROCESS_BEGIN();
@@ -127,7 +130,16 @@ PROCESS_THREAD(cc2538_demo_process, ev, data)
 
     if(ev == PROCESS_EVENT_TIMER) {
       leds_on(LEDS_PERIODIC);
-      printf("Counter = 0x%08x\n", counter);
+      printf("-----------------------------------------\n"
+             "Counter = 0x%08x\n", counter);
+
+      printf("VDD = %d mV\n",
+             vdd3_sensor.value(CC2538_SENSORS_VALUE_TYPE_CONVERTED));
+
+      printf("Temperature = %d mC\n",
+              cc2538_temp_sensor.value(CC2538_SENSORS_VALUE_TYPE_CONVERTED));
+
+      printf("Ambient light sensor = %d raw\n", als_sensor.value(0));
 
       etimer_set(&et, CLOCK_SECOND);
       rtimer_set(&rt, RTIMER_NOW() + LEDS_OFF_HYSTERISIS, 1,
@@ -140,7 +152,7 @@ PROCESS_THREAD(cc2538_demo_process, ev, data)
       } else if(data == &button_left_sensor || data == &button_right_sensor) {
         leds_toggle(LEDS_BUTTON);
       } else if(data == &button_down_sensor) {
-        cpu_cpsid();
+        INTERRUPTS_DISABLE();
         leds_on(LEDS_REBOOT);
         watchdog_reboot();
       } else if(data == &button_up_sensor) {

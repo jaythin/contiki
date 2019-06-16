@@ -30,24 +30,20 @@
  */
 
 /**
+ * \addtogroup roll-tm
+ * @{
+ */
+/**
  * \file
- *         This file implements IPv6 MCAST forwarding according to the
- *         algorithm described in the "MCAST Forwarding Using Trickle"
- *         internet draft.
- *
- *         The current version of the draft can always be found in
- *         http://tools.ietf.org/html/draft-ietf-roll-trickle-mcast
- *
- *         This implementation is based on the draft version stored in
- *         ROLL_TM_VER
- *
+ *    Implementation of the ROLL TM multicast engine
  * \author
- *         George Oikonomou - <oikonomou@users.sourceforge.net>
+ *    George Oikonomou - <oikonomou@users.sourceforge.net>
  */
 
 #include "contiki.h"
 #include "contiki-lib.h"
 #include "contiki-net.h"
+#include "net/ipv6/uip-icmp6.h"
 #include "net/ipv6/multicast/uip-mcast6.h"
 #include "net/ipv6/multicast/roll-tm.h"
 #include "dev/watchdog.h"
@@ -66,7 +62,6 @@
 #define VERBOSE_PRINT_SEED(...)
 #endif
 
-#if UIP_CONF_IPV6
 /*---------------------------------------------------------------------------*/
 /* Data Representation */
 /*---------------------------------------------------------------------------*/
@@ -473,10 +468,15 @@ extern uint16_t uip_slen;
 /*---------------------------------------------------------------------------*/
 /* Local function prototypes */
 /*---------------------------------------------------------------------------*/
-static void icmp_output();
-static void window_update_bounds();
+static void icmp_input(void);
+static void icmp_output(void);
+static void window_update_bounds(void);
 static void reset_trickle_timer(uint8_t);
 static void handle_timer(void *);
+/*---------------------------------------------------------------------------*/
+/* ROLL TM ICMPv6 handler declaration */
+UIP_ICMP6_HANDLER(roll_tm_icmp_handler, ICMP6_ROLL_TM,
+                  UIP_ICMP6_HANDLER_CODE_ANY, icmp_input);
 /*---------------------------------------------------------------------------*/
 /* Return a random number in [I/2, I), for a timer with Imin when the timer's
  * current number of doublings is d */
@@ -1090,8 +1090,9 @@ accept(uint8_t in)
   return UIP_MCAST6_ACCEPT;
 }
 /*---------------------------------------------------------------------------*/
-void
-roll_tm_icmp_input()
+/* ROLL TM ICMPv6 Input Handler */
+static void
+icmp_input()
 {
   uint8_t inconsistency;
   uint16_t *seq_ptr;
@@ -1099,33 +1100,33 @@ roll_tm_icmp_input()
   uint16_t val;
 
 #if UIP_CONF_IPV6_CHECKS
-  if(!uip_is_addr_link_local(&UIP_IP_BUF->srcipaddr)) {
+  if(!uip_is_addr_linklocal(&UIP_IP_BUF->srcipaddr)) {
     PRINTF("ROLL TM: ICMPv6 In, bad source ");
     PRINT6ADDR(&UIP_IP_BUF->srcipaddr);
     PRINTF(" to ");
     PRINT6ADDR(&UIP_IP_BUF->destipaddr);
     PRINTF("\n");
     ROLL_TM_STATS_ADD(icmp_bad);
-    return;
+    goto discard;
   }
 
   if(!uip_is_addr_linklocal_allnodes_mcast(&UIP_IP_BUF->destipaddr)
      && !uip_is_addr_linklocal_allrouters_mcast(&UIP_IP_BUF->destipaddr)) {
     PRINTF("ROLL TM: ICMPv6 In, bad destination\n");
     ROLL_TM_STATS_ADD(icmp_bad);
-    return;
+    goto discard;
   }
 
   if(UIP_ICMP_BUF->icode != ROLL_TM_ICMP_CODE) {
     PRINTF("ROLL TM: ICMPv6 In, bad ICMP code\n");
     ROLL_TM_STATS_ADD(icmp_bad);
-    return;
+    goto discard;
   }
 
   if(UIP_IP_BUF->ttl != ROLL_TM_IP_HOP_LIMIT) {
     PRINTF("ROLL TM: ICMPv6 In, bad TTL\n");
     ROLL_TM_STATS_ADD(icmp_bad);
-    return;
+    goto discard;
   }
 #endif
 
@@ -1310,6 +1311,9 @@ drop:
     t[1].c++;
   }
 
+discard:
+
+  uip_len = 0;
   return;
 }
 /*---------------------------------------------------------------------------*/
@@ -1379,8 +1383,7 @@ out()
 
 drop:
   uip_slen = 0;
-  uip_len = 0;
-  uip_ext_len = 0;
+  uip_clear_buf();
 }
 /*---------------------------------------------------------------------------*/
 static uint8_t
@@ -1417,6 +1420,9 @@ init()
   ROLL_TM_STATS_INIT();
   UIP_MCAST6_STATS_INIT(&stats);
 
+  /* Register the ICMPv6 input handler */
+  uip_icmp6_register_input_handler(&roll_tm_icmp_handler);
+
   for(iterswptr = &windows[ROLL_TM_WINS - 1]; iterswptr >= windows;
       iterswptr--) {
     iterswptr->lower_bound = -1;
@@ -1431,6 +1437,9 @@ init()
   return;
 }
 /*---------------------------------------------------------------------------*/
+/**
+ * \brief The ROLL TM engine driver
+ */
 const struct uip_mcast6_driver roll_tm_driver = {
   "ROLL TM",
   init,
@@ -1438,5 +1447,4 @@ const struct uip_mcast6_driver roll_tm_driver = {
   in,
 };
 /*---------------------------------------------------------------------------*/
-
-#endif /* UIP_CONF_IPV6 */
+/** @} */

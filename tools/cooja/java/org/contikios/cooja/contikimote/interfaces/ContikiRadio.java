@@ -39,15 +39,16 @@ import org.jdom.Element;
 import org.contikios.cooja.COOJARadioPacket;
 import org.contikios.cooja.Mote;
 import org.contikios.cooja.RadioPacket;
-import org.contikios.cooja.SectionMoteMemory;
+import org.contikios.cooja.mote.memory.SectionMoteMemory;
 import org.contikios.cooja.Simulation;
 import org.contikios.cooja.contikimote.ContikiMote;
 import org.contikios.cooja.contikimote.ContikiMoteInterface;
 import org.contikios.cooja.interfaces.PolledAfterActiveTicks;
 import org.contikios.cooja.interfaces.Position;
 import org.contikios.cooja.interfaces.Radio;
+import org.contikios.cooja.mote.memory.VarMemory;
 import org.contikios.cooja.radiomediums.UDGM;
-
+import org.contikios.cooja.util.CCITT_CRC;
 /**
  * Packet radio transceiver mote interface.
  *
@@ -61,6 +62,7 @@ import org.contikios.cooja.radiomediums.UDGM;
  * <p>
  * <li>int simInSize (size of received data packet)
  * <li>byte[] simInDataBuffer (data of received data packet)
+ * <li>int64_t simLastPacketTimestamp (timestamp of the last received data packet)
  * <p>
  * <li>int simOutSize (size of transmitted data packet)
  * <li>byte[] simOutDataBuffer (data of transmitted data packet)
@@ -89,7 +91,7 @@ import org.contikios.cooja.radiomediums.UDGM;
 public class ContikiRadio extends Radio implements ContikiMoteInterface, PolledAfterActiveTicks {
   private ContikiMote mote;
 
-  private SectionMoteMemory myMoteMemory;
+  private VarMemory myMoteMemory;
 
   private static Logger logger = Logger.getLogger(ContikiRadio.class);
 
@@ -132,7 +134,7 @@ public class ContikiRadio extends Radio implements ContikiMoteInterface, PolledA
         ContikiRadio.class, "RADIO_TRANSMISSION_RATE_kbps");
 
     this.mote = (ContikiMote) mote;
-    this.myMoteMemory = (SectionMoteMemory) mote.getMemory();
+    this.myMoteMemory = new VarMemory(mote.getMemory());
 
     radioOn = myMoteMemory.getByteValueOf("simRadioHWOn") == 1;
   }
@@ -189,6 +191,8 @@ public class ContikiRadio extends Radio implements ContikiMoteInterface, PolledA
     lastEventTime = mote.getSimulation().getSimulationTime();
     lastEvent = RadioEvent.RECEPTION_STARTED;
 
+    myMoteMemory.setInt64ValueOf("simLastPacketTimestamp", lastEventTime);
+
     this.setChanged();
     this.notifyObservers();
   }
@@ -199,7 +203,7 @@ public class ContikiRadio extends Radio implements ContikiMoteInterface, PolledA
       packetToMote = null;
       myMoteMemory.setIntValueOf("simInSize", 0);
     } else {
-      myMoteMemory.setIntValueOf("simInSize", packetToMote.getPacketData().length);
+      myMoteMemory.setIntValueOf("simInSize", packetToMote.getPacketData().length - 2);
       myMoteMemory.setByteArray("simInDataBuffer", packetToMote.getPacketData());
     }
 
@@ -329,7 +333,7 @@ public class ContikiRadio extends Radio implements ContikiMoteInterface, PolledA
     /* New transmission */
     int size = myMoteMemory.getIntValueOf("simOutSize");
     if (!isTransmitting && size > 0) {
-      packetFromMote = new COOJARadioPacket(myMoteMemory.getByteArray("simOutDataBuffer", size));
+      packetFromMote = new COOJARadioPacket(myMoteMemory.getByteArray("simOutDataBuffer", size + 2));
 
       if (packetFromMote.getPacketData() == null || packetFromMote.getPacketData().length == 0) {
         logger.warn("Skipping zero sized Contiki packet (no buffer)");
@@ -337,6 +341,15 @@ public class ContikiRadio extends Radio implements ContikiMoteInterface, PolledA
         mote.requestImmediateWakeup();
         return;
       }
+
+      byte[] data = packetFromMote.getPacketData();
+      CCITT_CRC txCrc = new CCITT_CRC();
+      txCrc.setCRC(0);
+      for (int i = 0; i < size; i++) {
+        txCrc.addBitrev(data[i]);
+      }
+      data[size] = (byte)txCrc.getCRCHi();
+      data[size + 1] = (byte)txCrc.getCRCLow();
 
       isTransmitting = true;
 
